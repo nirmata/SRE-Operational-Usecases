@@ -6,7 +6,6 @@ This repository includes resources for testing a Kyverno policy designed to clea
 
 ## Usage:
 
-```
 ### RBAC Configuration
 For the Kyverno cleanup policy to function correctly, it requires permissions to cleanup replicasets across all namespaces. Deploy `cleanup-clusterrole.yaml` and create clusterrolebinding to kyverno-cleanup-controller serviceaccount in kyverno namespace with clusterrole which we have created for this purpose.
 
