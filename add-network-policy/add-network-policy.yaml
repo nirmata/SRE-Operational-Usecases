@@ -24,6 +24,9 @@ spec:
       - resources:
           kinds:
           - Namespace
+          namespaces:
+          - kyverno-test
+          - default
     exclude:
       any:
       - resources:
