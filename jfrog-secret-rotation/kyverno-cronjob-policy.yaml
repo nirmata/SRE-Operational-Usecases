@@ -1,0 +1,150 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-jfrog-secret-rotation
+spec:
+  generateExisting: true
+  rules:
+    - name: generate-cronjob
+      match:
+        resources:
+          kinds:
+            - Namespace
+          names:
+            - jfrog-secrets
+      generate:
+        apiVersion: batch/v1
+        kind: CronJob
+        name: rotate-jfrog-token
+        namespace: jfrog-secrets
+        synchronize: true
+        data:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: rotate-jfrog-token
+            namespace: jfrog-secrets
+          spec:
+            schedule: "*/2 * * * *"
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: jfrog-secret-rotator
+                    containers:
+                      - name: token-rotator
+                        image: anuddeeph/kubectl:curl-jq
+                        command:
+                          - /bin/sh
+                          - -c
+                          - |
+                            # Fetch new JFrog token
+                            NEW_TOKEN=$(curl -X POST -u "$JFROG_USER:$JFROG_PASSWORD" \
+                                -H "Content-Type: application/x-www-form-urlencoded" \
+                                -d "username=$JFROG_USER" -d "scope=member-of-groups:readers" \
+                                "$JFROG_URL/artifactory/api/security/token" | jq -r .access_token)
+
+                            if [ -z "$NEW_TOKEN" ] || [ "$NEW_TOKEN" = "null" ]; then
+                                echo "❌ Failed to fetch JFrog token"
+                                exit 1
+                            fi
+
+                            # Create .dockerconfigjson content
+                            DOCKER_CONFIG_JSON=$(echo -n "{\"auths\":{\"$JFROG_URL\":{\"username\":\"$JFROG_USER\",\"password\":\"$NEW_TOKEN\",\"auth\":\"$(echo -n "$JFROG_USER:$NEW_TOKEN" | base64)\"}}}")
+
+                            # Encode to base64
+                            ENCODED_DOCKER_CONFIG_JSON=$(echo -n "$DOCKER_CONFIG_JSON" | base64 | tr -d '\n')
+
+                            echo "🔄 Deleting existing JFrog secret..."
+                            kubectl delete secret jfrog-token -n jfrog-secrets --ignore-not-found=true --wait=true
+                            echo "🆕 Creating new JFrog secret..."
+                            kubectl create secret docker-registry jfrog-token --docker-server="$JFROG_URL" --docker-username="$JFROG_USER" --docker-password="$NEW_TOKEN" --namespace=jfrog-secrets
+
+                            echo "✅ JFrog Docker registry token successfully rotated."
+                        env:
+                          - name: JFROG_URL
+                            value: "https://npm2013.jfrog.io"
+                          - name: JFROG_USER
+                            valueFrom:
+                              secretKeyRef:
+                                name: jfrog-credentials
+                                key: username
+                          - name: JFROG_PASSWORD
+                            valueFrom:
+                              secretKeyRef:
+                                name: jfrog-credentials
+                                key: password
+                    restartPolicy: OnFailure
+
+    - name: generate-serviceaccount
+      match:
+        resources:
+          kinds:
+            - Namespace
+          names:
+            - jfrog-secrets
+      generate:
+        apiVersion: v1
+        kind: ServiceAccount
+        name: jfrog-secret-rotator
+        namespace: jfrog-secrets
+        synchronize: true
+        data:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: jfrog-secret-rotator
+            namespace: jfrog-secrets
+
+    - name: generate-role
+      match:
+        resources:
+          kinds:
+            - Namespace
+          names:
+            - jfrog-secrets
+      generate:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        name: secret-manager
+        namespace: jfrog-secrets
+        synchronize: true
+        data:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: secret-manager
+            namespace: jfrog-secrets
+          rules:
+            - apiGroups: [""]
+              resources: ["secrets"]
+              verbs: ["create", "update", "patch", "delete"]
+
+    - name: generate-rolebinding
+      match:
+        resources:
+          kinds:
+            - Namespace
+          names:
+            - jfrog-secrets
+      generate:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: secret-manager-binding
+        namespace: jfrog-secrets
+        synchronize: true
+        data:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: secret-manager-binding
+            namespace: jfrog-secrets
+          subjects:
+            - kind: ServiceAccount
+              name: jfrog-secret-rotator
+              namespace: jfrog-secrets
+          roleRef:
+            kind: Role
+            name: secret-manager
+            apiGroup: rbac.authorization.k8s.io
+
