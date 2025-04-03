@@ -1,0 +1,386 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: manage-scaler-resources
+spec:
+  generateExisting: true
+  rules:
+    # Rule to create ServiceAccount 'scaler' in each namespace
+    - name: create-scaler-sa
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: v1
+        kind: ServiceAccount
+        name: scaler
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: scaler
+            namespace: "{{request.object.metadata.name}}"
+
+    # Rule to create ClusterRole 'scaler-manager'
+    - name: generate-clusterrole
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        name: scaler-manager
+        synchronize: true
+        data:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: scaler-manager
+          rules:
+            - apiGroups: ["apps"]
+              resources: ["deployments", "deployments/scale"]
+              verbs: ["get", "list", "patch", "update"]
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              verbs: ["create", "delete", "list", "get", "patch", "update"]
+            - apiGroups: [""]
+              resources: ["namespaces"]
+              verbs: ["list", "get"]
+
+    # Rule to create ClusterRoleBinding for namespace listing
+    - name: generate-clusterrolebinding
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: "scaler-manager-global-{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "scaler-manager-global-{{request.object.metadata.name}}"
+          subjects:
+            - kind: ServiceAccount
+              name: scaler
+              namespace: "{{request.object.metadata.name}}"
+          roleRef:
+            kind: ClusterRole
+            name: scaler-manager
+            apiGroup: rbac.authorization.k8s.io
+
+    # Rule to create RoleBinding in each namespace
+    - name: generate-rolebinding
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: scaler-manager-binding
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: scaler-manager-binding
+            namespace: "{{request.object.metadata.name}}"
+          subjects:
+            - kind: ServiceAccount
+              name: scaler
+              namespace: "{{request.object.metadata.name}}"
+          roleRef:
+            kind: ClusterRole
+            name: scaler-manager
+            apiGroup: rbac.authorization.k8s.io
+
+    # Rule to create CronJob for scaling down deployments
+    - name: create-scale-down-cronjob
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: batch/v1
+        kind: CronJob
+        name: scale-down-deployments
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: scale-down-deployments
+            namespace: "{{request.object.metadata.name}}"
+          spec:
+            schedule: "36 16 * * *"  # 10:06 PM IST
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: scaler
+                    containers:
+                      - name: scaler
+                        image: anuddeeph/kubectl:curl-jq
+                        command:
+                          - /bin/sh
+                          - -c
+                          - |
+                            # Define excluded namespaces
+                            EXCLUDED_NS="kube-system nirmata nirmata-system kyverno"
+                            CONFIGMAP_NAME="deployment-replicas"
+
+                            # Function to check if a namespace is excluded
+                            is_excluded() {
+                              local ns="$1"
+                              for excluded in $EXCLUDED_NS; do
+                                if [ "$ns" = "$excluded" ]; then
+                                  return 0
+                                fi
+                              done
+                              return 1
+                            }
+
+                            # Store current replica counts for a namespace
+                            store_replicas() {
+                              local ns="$1"
+                              echo "Storing replica counts for namespace: $ns"
+                              
+                              # First, get existing configmap or create new one
+                              if ! kubectl get configmap $CONFIGMAP_NAME -n default &>/dev/null; then
+                                echo "Creating new configmap $CONFIGMAP_NAME"
+                                kubectl create configmap $CONFIGMAP_NAME -n default --from-literal=dummy=dummy
+                              fi
+                              
+                              # Get all deployments and their replicas in the namespace
+                              DEPLOYMENTS=$(kubectl get deployment -n "$ns" -o json)
+                              if [ $? -ne 0 ]; then
+                                echo "Failed to get deployments in namespace: $ns"
+                                return
+                              fi
+                              
+                              # Process each deployment
+                              echo "$DEPLOYMENTS" | jq -r '.items[] | "\(.metadata.name)=\(.spec.replicas // 0)"' | \
+                              while IFS='=' read -r name replicas; do
+                                if [ ! -z "$name" ]; then
+                                  echo "Processing deployment: $name with replicas: $replicas"
+                                  
+                                  # Create the key in format namespace.deployment
+                                  KEY="$ns.$name"
+                                  
+                                  # Update the ConfigMap
+                                  echo "Updating ConfigMap for $KEY=$replicas"
+                                  kubectl patch configmap $CONFIGMAP_NAME -n default --type=merge \
+                                    -p="{\"data\":{\"$KEY\":\"$replicas\"}}"
+                                  
+                                  if [ $? -eq 0 ]; then
+                                    echo "Successfully updated ConfigMap for $KEY"
+                                  else
+                                    echo "Failed to update ConfigMap for $KEY"
+                                  fi
+                                fi
+                              done
+                            }
+
+                            # Scale down deployments in a namespace
+                            scale_down() {
+                              local ns="$1"
+                              echo "Scaling down deployments in namespace: $ns"
+                              
+                              # Get all deployments in the namespace
+                              DEPLOYMENTS=$(kubectl get deployment -n "$ns" -o json)
+                              if [ $? -ne 0 ]; then
+                                echo "Failed to get deployments in namespace: $ns"
+                                return
+                              fi
+                              
+                              # Process each deployment
+                              echo "$DEPLOYMENTS" | jq -r '.items[] | .metadata.name' | \
+                              while read -r name; do
+                                if [ ! -z "$name" ]; then
+                                  echo "Scaling down deployment: $name"
+                                  kubectl scale deployment "$name" --replicas=0 -n "$ns"
+                                fi
+                              done
+                            }
+
+                            # Process all namespaces
+                            process_namespaces() {
+                              # Get all namespaces except excluded ones
+                              kubectl get namespaces -o json | \
+                              jq -r '.items[] | .metadata.name' | \
+                              while read -r ns; do
+                                if ! is_excluded "$ns"; then
+                                  echo "Processing namespace: $ns"
+                                  store_replicas "$ns"
+                                  scale_down "$ns"
+                                else
+                                  echo "Skipping excluded namespace: $ns"
+                                fi
+                              done
+                            }
+
+                            # Main execution
+                            process_namespaces
+
+                            # Notify webhook
+                            curl -X POST http://google.com/webhook
+                    restartPolicy: OnFailure
+
+    # Rule to create CronJob for scaling up deployments
+    - name: create-scale-up-cronjob
+      match:
+        resources:
+          kinds:
+            - Namespace
+      exclude:
+        resources:
+          names:
+            - kube-system
+            - nirmata
+            - nirmata-system
+            - kyverno
+      generate:
+        apiVersion: batch/v1
+        kind: CronJob
+        name: scale-up-deployments
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: scale-up-deployments
+            namespace: "{{request.object.metadata.name}}"
+          spec:
+            schedule: "40 16 * * *"  # 10:10 PM IST
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: scaler
+                    containers:
+                      - name: scaler
+                        image: anuddeeph/kubectl:curl-jq
+                        command:
+                          - /bin/sh
+                          - -c
+                          - |
+                            # Define excluded namespaces - MUST match policy exclusions exactly
+                            EXCLUDED_NS="kube-system nirmata nirmata-system kyverno"
+                            CONFIGMAP_NAME="deployment-replicas"
+
+                            # Function to check if a namespace is excluded
+                            is_excluded() {
+                              local ns="$1"
+                              for excluded in $EXCLUDED_NS; do
+                                if [ "$ns" = "$excluded" ]; then
+                                  return 0
+                                fi
+                              done
+                              return 1
+                            }
+
+                            # Restore replica counts for a namespace
+                            restore_replicas() {
+                              local ns="$1"
+                              echo "Restoring replica counts for namespace: $ns"
+                              
+                              # Get all entries for namespace from ConfigMap
+                              CM_DATA=$(kubectl get configmap $CONFIGMAP_NAME -n default -o json)
+                              if [ $? -ne 0 ]; then
+                                echo "Failed to get ConfigMap data"
+                                return
+                              fi
+                              
+                              echo "$CM_DATA" | \
+                              jq -r --arg ns "$ns" \
+                                '.data | to_entries[] | 
+                                 select(.key | startswith($ns + ".")) | 
+                                 "\(.key) \(.value)"' | \
+                              while read -r key replicas; do
+                                if [ ! -z "$key" ] && [ ! -z "$replicas" ]; then
+                                  # Extract deployment name from key
+                                  name="${key#$ns.}"
+                                  echo "Restoring deployment: $name to replicas: $replicas"
+                                  
+                                  # Scale up the deployment
+                                  if kubectl scale deployment "$name" --replicas="$replicas" -n "$ns"; then
+                                    echo "Successfully scaled deployment: $name"
+                                    
+                                    # Remove the entry from ConfigMap
+                                    echo "Removing ConfigMap entry: $key"
+                                    kubectl patch configmap $CONFIGMAP_NAME -n default --type=merge \
+                                      -p="{\"data\":{\"$key\":null}}"
+                                  else
+                                    echo "Failed to scale deployment: $name"
+                                  fi
+                                fi
+                              done
+                            }
+
+                            # Process all namespaces
+                            process_namespaces() {
+                              # Get all namespaces except excluded ones
+                              kubectl get namespaces -o json | \
+                              jq -r '.items[] | .metadata.name' | \
+                              while read -r ns; do
+                                if ! is_excluded "$ns"; then
+                                  echo "Processing namespace: $ns"
+                                  restore_replicas "$ns"
+                                else
+                                  echo "Skipping excluded namespace: $ns"
+                                fi
+                              done
+                            }
+
+                            # Main execution
+                            process_namespaces
+
+                            # Notify webhook
+                            curl -X POST http://google.com/webhook
+                    restartPolicy: OnFailure
