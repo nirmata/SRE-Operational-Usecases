@@ -1,0 +1,234 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: orphaned-service-detector
+  annotations:
+    policies.kyverno.io/title: Orphaned Service Detector
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Detects and marks services without endpoints. Unmarking is handled when endpoints appear.
+    policies.kyverno.io/debug: "{{ request.object.metadata.name }} has endpoints: {{ hasEndpoints }}"
+    policies.kyverno.io/log-webhook-events: "true"
+spec:
+  validationFailureAction: Audit
+  background: true
+  #webhookTimeoutSeconds: 10
+  mutateExistingOnPolicyUpdate: true
+  rules:
+    - name: mark-orphaned-services
+      match:
+        any:
+        - resources:
+            kinds:
+            - Service
+      exclude:
+        any:
+        - resources:
+            namespaces:
+            - kube-system
+            - kube-public
+            - kyverno
+        - resources:
+            selector:
+              matchLabels:
+                cleanup.resource: "marked-for-deletion"
+        - resources:
+            names:
+            - kubernetes
+      context:
+        - name: hasEndpoints
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{request.namespace}}/endpoints/{{request.object.metadata.name}}"
+            jmesPath: "(subsets || `[]`) | length(@) > `0`"
+        - name: debugInfo
+          variable:
+            value: "Service: {{request.object.metadata.name}}, Namespace: {{request.namespace}}, Has Endpoints: {{hasEndpoints}}"
+      preconditions:
+        all:
+        - key: "{{ request.object.spec.type }}"
+          operator: NotEquals
+          value: ExternalName
+        - key: "{{ hasEndpoints }}"
+          operator: Equals
+          value: false
+      mutate:
+        targets:
+          - apiVersion: v1
+            kind: Service
+            namespace: "{{request.namespace}}"
+            name: "{{request.object.metadata.name}}"
+        patchStrategicMerge:
+          metadata:
+            labels:
+              cleanup.resource: "marked-for-deletion"
+              cleanup.resource/reason: "no-endpoints"
+            annotations:
+              cleanup.resource/message: "Service has no associated endpoints"
+              cleanup.resource/marked-time: "{{ time_now_utc() }}"
+              cleanup.resource/debug-info: "{{ debugInfo }}"
+              cleanup.resource/event: "OrphanedService - Service has no endpoints and has been marked for deletion at {{ time_now_utc() }}"
+              kyverno.io/mutation-log: "Service marked as orphaned due to no endpoints at {{ time_now_utc() }}"
+
+    - name: generate-event-for-orphaned-service
+      match:
+        any:
+        - resources:
+            kinds:
+            - Service
+      context:
+        - name: isMarked
+          variable:
+            value: "{{ request.object.metadata.labels.\"cleanup.resource\" || '' }}"
+        - name: hasNoEndpointsReason
+          variable:
+            value: "{{ request.object.metadata.labels.\"cleanup.resource/reason\" || '' }}"
+      preconditions:
+        all:
+        - key: "{{ isMarked }}"
+          operator: Equals
+          value: "marked-for-deletion"
+        - key: "{{ hasNoEndpointsReason }}"
+          operator: Equals
+          value: "no-endpoints"
+      generate:
+        apiVersion: v1
+        kind: Event
+        name: "orphaned-service-{{request.object.metadata.name}}"
+        namespace: "{{request.namespace}}"
+        synchronize: false
+        generateExisting: true
+        data:
+          firstTimestamp: "{{time_now_utc()}}"
+          lastTimestamp: "{{time_now_utc()}}"
+          message: "Service {{request.object.metadata.name}} has been marked as orphaned due to having no endpoints."
+          reason: OrphanedServiceDetected
+          type: Warning
+          involvedObject:
+            apiVersion: v1
+            kind: Service
+            name: "{{request.object.metadata.name}}"
+            namespace: "{{request.namespace}}"
+            uid: "{{request.object.metadata.uid}}"
+
+    - name: unmark-services-with-endpoints
+      match:
+        any:
+        - resources:
+            kinds:
+            - Service
+            selector:
+              matchLabels:
+                cleanup.resource: "marked-for-deletion"
+                cleanup.resource/reason: "no-endpoints"
+      context:
+        - name: hasEndpoints
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{request.namespace}}/endpoints/{{request.object.metadata.name}}"
+            jmesPath: "(subsets || `[]`) | length(@) > `0`"
+        - name: debugInfo
+          variable:
+            value: "Service: {{request.object.metadata.name}}, Namespace: {{request.namespace}}, Has Endpoints: {{hasEndpoints}}"
+      preconditions:
+        all:
+        - key: "{{ hasEndpoints }}"
+          operator: Equals
+          value: true
+      mutate:
+        targets:
+          - apiVersion: v1
+            kind: Service
+            namespace: "{{request.namespace}}"
+            name: "{{request.object.metadata.name}}"
+        patchesJson6902: |-
+          - path: "/metadata/labels/cleanup.resource"
+            op: remove
+          - path: "/metadata/labels/cleanup.resource~1reason"
+            op: remove
+          - path: "/metadata/annotations/cleanup.resource~1message"
+            op: remove
+          - path: "/metadata/annotations/cleanup.resource~1marked-time"
+            op: remove
+          - path: "/metadata/annotations/cleanup.resource~1unmarked-time"
+            op: add
+            value: "{{ time_now_utc() }}"
+          - path: "/metadata/annotations/cleanup.resource~1debug-info"
+            op: add
+            value: "{{ debugInfo }}"
+          - path: "/metadata/annotations/cleanup.resource~1event"
+            op: add
+            value: "ServiceRecovered - Service has recovered and now has active endpoints at {{ time_now_utc() }}"
+          - path: "/metadata/annotations/kyverno.io~1mutation-log"
+            op: add
+            value: "Service unmarked as endpoints were detected at {{ time_now_utc() }}"
+
+    - name: generate-event-for-recovered-service
+      match:
+        any:
+        - resources:
+            kinds:
+            - Service
+      context:
+        - name: hasRecoveryAnnotation
+          variable:
+            value: "{{ request.object.metadata.annotations.\"cleanup.resource/unmarked-time\" || '' }}"
+      preconditions:
+        all:
+        - key: "{{ hasRecoveryAnnotation }}"
+          operator: NotEquals
+          value: ""
+      generate:
+        apiVersion: v1
+        kind: Event
+        name: "recovered-service-{{request.object.metadata.name}}"
+        namespace: "{{request.namespace}}"
+        synchronize: false
+        generateExisting: true
+        data:
+          firstTimestamp: "{{time_now_utc()}}"
+          lastTimestamp: "{{time_now_utc()}}"
+          message: "Service {{request.object.metadata.name}} has been unmarked as it now has active endpoints."
+          reason: ServiceRecovered
+          type: Normal
+          involvedObject:
+            apiVersion: v1
+            kind: Service
+            name: "{{request.object.metadata.name}}"
+            namespace: "{{request.namespace}}"
+            uid: "{{request.object.metadata.uid}}"
+
+---
+# RBAC permissions for the Kyverno background controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno-orphaned-service-controller
+rules:
+# Permission to get/list/update services
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+# Permission to get/list endpoints
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+# Permission to create and manage events - explicitly in all namespaces
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch", "update", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kyverno-orphaned-service-binding
+subjects:
+- kind: ServiceAccount
+  name: kyverno-background-controller
+  namespace: kyverno
+- kind: ServiceAccount
+  name: kyverno-admission-controller
+  namespace: kyverno
+roleRef:
+  kind: ClusterRole
+  name: kyverno-orphaned-service-controller
+  apiGroup: rbac.authorization.k8s.io 

@@ -1,0 +1,27 @@
+apiVersion: kyverno.io/v2
+kind: ClusterCleanupPolicy
+metadata:
+  name: orphaned-service-cleanup
+  annotations:
+    policies.kyverno.io/title: Orphaned Service Cleanup
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Automatically deletes services that have been marked as orphaned for more than the specified time.
+spec:
+  match:
+    any:
+    - resources:
+        kinds:
+        - Service
+        selector:
+          matchLabels:
+            cleanup.resource: "marked-for-deletion"
+            cleanup.resource/reason: "no-endpoints"
+  conditions:
+    all:
+    - key: "{{ time_diff('{{target.metadata.annotations.\"cleanup.resource/marked-time\"}}','{{ time_now_utc() }}') }}"
+      operator: GreaterThan
+      value: "0h2m0s"  # For testing use 2 minutes. Change to days in production: value: "168h0m0s" (7 days)
+  schedule: "*/1 * * * *"  # Run every minute
+
