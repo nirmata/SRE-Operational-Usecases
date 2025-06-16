@@ -20,19 +20,26 @@ Deploy the necessary RBAC permissions for the background controller:
 kubectl apply -f background-controller-role-rolebinding.yaml
 ```
 
-### 3. Apply the Kyverno CronJob Policy
+
+### 3. Apply Role and RoleBinding for admission Controller
+Deploy the necessary RBAC permissions for the admission controller:
+```sh
+kubectl apply -f kyverno-admission-controller-rbac.yaml
+```
+
+### 4. Apply the Kyverno CronJob Policy
 This policy will create a cronjob, service account, and necessary permissions to manage secrets.
 ```sh
 kubectl apply -f kyverno-cronjob-policy.yaml
 ```
 
-### 4. Apply the Sync-Secrets Policy
+### 5. Apply the Sync-Secrets Policy
 This policy synchronizes the `jfrog-token` secret across namespaces:
 ```sh
 kubectl apply -f sync-secrets.yaml
 ```
 
-### 5. Update Background Controller Deployment
+### 6. Update Background Controller Deployment
 Edit the background controller deployment and add the following environment variable to set the scan interval:
 ```yaml
 - name: BACKGROUND_SCAN_INTERVAL
