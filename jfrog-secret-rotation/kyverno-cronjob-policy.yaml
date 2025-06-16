@@ -12,6 +12,7 @@ spec:
             - Namespace
           names:
             - jfrog-secrets
+      skipBackgroundRequests: false
       generate:
         apiVersion: batch/v1
         kind: CronJob
@@ -83,6 +84,7 @@ spec:
             - Namespace
           names:
             - jfrog-secrets
+      skipBackgroundRequests: false
       generate:
         apiVersion: v1
         kind: ServiceAccount
